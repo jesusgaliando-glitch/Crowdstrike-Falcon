@@ -250,7 +250,8 @@ function Generate-HTMLReport {
             "*Running*" { "status-running" }
             "*Not Running*" { "status-stopped" }
             "Not Installed" { "status-missing" }
-            "Offline" { "status-offline" }
+            "Offline*" { "status-offline" }
+            "*Online but No*" { "status-missing" }
             default { "status-offline" }
         }
 
@@ -359,25 +360,50 @@ foreach ($computer in $computers) {
             InstallPath = $null
             LastChecked = Get-Date
             ResponseTime = $null
+            ErrorDetails = $null
         }
 
-        $pingStart = Get-Date
-
+        $connStart = Get-Date
         $isOnline = $false
+        $lastError = $null
+
         for ($i = 1; $i -le $RetryAttempts; $i++) {
-            if (Test-Connection -ComputerName $ComputerName -Count 1 -Quiet -TimeoutSeconds $Timeout) {
+            try {
+                $testService = Get-Service -ComputerName $ComputerName -Name "CSFalconService" -ErrorAction Stop
                 $isOnline = $true
                 break
+            } catch {
+                $lastError = $_.Exception.Message
+                if ($i -lt $RetryAttempts) {
+                    Start-Sleep -Milliseconds 1000
+                }
             }
-            if ($i -lt $RetryAttempts) {
-                Start-Sleep -Milliseconds 500
+
+            try {
+                $null = [System.Net.Dns]::GetHostAddresses($ComputerName) -ErrorAction Stop
+                if (Test-Connection -ComputerName $ComputerName -Count 1 -Quiet -TimeoutSeconds $Timeout) {
+                    $isOnline = $true
+                    break
+                }
+            } catch {
+                $lastError = $_.Exception.Message
             }
         }
 
-        $result.ResponseTime = ((Get-Date) - $pingStart).TotalMilliseconds
+        $result.ResponseTime = ((Get-Date) - $connStart).TotalMilliseconds
 
         if (-not $isOnline) {
-            $result.Status = "Offline"
+            try {
+                $testReg = [Microsoft.Win32.RegistryKey]::OpenRemoteBaseKey('LocalMachine', $ComputerName)
+                if ($testReg) {
+                    $testReg.Close()
+                    $result.Status = "Online but No CrowdStrike Service"
+                } else {
+                    $result.Status = "Offline/Unreachable"
+                }
+            } catch {
+                $result.Status = "Offline/Unreachable"
+            }
             return $result
         }
 
@@ -390,15 +416,19 @@ foreach ($computer in $computers) {
             try {
                 $regPath = "SOFTWARE\CrowdStrike\{9b03c1d9-3138-44ed-9fae-d9f4c034b88d}\{16e0423f-7058-48c9-a204-725362b67639}\Default"
                 $reg = [Microsoft.Win32.RegistryKey]::OpenRemoteBaseKey('LocalMachine', $ComputerName)
-                $key = $reg.OpenSubKey($regPath)
 
-                if ($key) {
-                    $result.Version = $key.GetValue("Version")
-                    $result.InstallPath = $key.GetValue("InstallPath")
-                    $key.Close()
+                if ($reg) {
+                    $key = $reg.OpenSubKey($regPath)
+                    if ($key) {
+                        $result.Version = $key.GetValue("Version")
+                        $result.InstallPath = $key.GetValue("InstallPath")
+                        $key.Close()
+                    }
+                    $reg.Close()
                 }
-                $reg.Close()
-            } catch { }
+            } catch {
+                $result.ErrorDetails = "Could not read registry: $($_.Exception.Message)"
+            }
 
             if ($service.Status -eq "Running") {
                 $result.Status = "Installed and Running"
@@ -407,7 +437,16 @@ foreach ($computer in $computers) {
             }
 
         } catch {
-            $result.Status = "Not Installed"
+            try {
+                $wmiResult = Get-WmiObject -Class Win32_Process -ComputerName $ComputerName -Filter "Name='csfalcon.exe'" -ErrorAction Stop
+                if ($wmiResult) {
+                    $result.Status = "CrowdStrike Running (WMI)"
+                } else {
+                    $result.Status = "Not Installed"
+                }
+            } catch {
+                $result.Status = "Not Installed"
+            }
         }
 
         return $result
